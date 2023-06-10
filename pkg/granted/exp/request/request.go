@@ -10,9 +10,8 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/lithammer/fuzzysearch/fuzzy"
-
 	"github.com/AlecAivazis/survey/v2"
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/briandowns/spinner"
 	"github.com/common-fate/cli/pkg/client"
 	cfconfig "github.com/common-fate/cli/pkg/config"
@@ -21,10 +20,12 @@ import (
 	"github.com/common-fate/common-fate/pkg/types"
 	"github.com/common-fate/granted/pkg/accessrequest"
 	"github.com/common-fate/granted/pkg/cache"
+	"github.com/common-fate/granted/pkg/cfaws"
 	"github.com/common-fate/granted/pkg/config"
 	"github.com/common-fate/granted/pkg/frecency"
 	"github.com/common-fate/granted/pkg/securestorage"
 	"github.com/hako/durafmt"
+	"github.com/lithammer/fuzzysearch/fuzzy"
 	"github.com/pkg/errors"
 	"github.com/urfave/cli/v2"
 	"golang.org/x/sync/errgroup"
@@ -85,6 +86,7 @@ type requestAccessOpts struct {
 }
 
 func requestAccess(ctx context.Context, opts requestAccessOpts) error {
+
 	cfcfg, err := cfconfig.Load()
 	if err != nil {
 		return err
@@ -102,65 +104,10 @@ func requestAccess(ctx context.Context, opts requestAccessOpts) error {
 
 	depID := cfcfg.CurrentOrEmpty().DashboardURL
 
-	existingRules, err := getCachedAccessRules(depID)
+	accounts, existingRules, accessRulesForAccount, err := RefreshCachedAccessRules(ctx, depID, cf)
 	if err != nil {
 		return err
 	}
-
-	clio.Debugw("got cached access rules", "rules", existingRules)
-
-	rules, err := cf.UserListAccessRulesWithResponse(ctx)
-	if err != nil {
-		return err
-	}
-
-	for _, r := range rules.JSON200.AccessRules {
-		var g errgroup.Group
-
-		g.Go(func() error {
-			return updateCachedAccessRule(ctx, updateCacheOpts{
-				Rule:         r,
-				Existing:     existingRules,
-				DeploymentID: depID,
-				CF:           cf,
-			})
-		})
-
-		err = g.Wait()
-		if err != nil {
-			return err
-		}
-	}
-
-	// refresh the cache
-	existingRules, err = getCachedAccessRules(depID)
-	if err != nil {
-		return err
-	}
-
-	clio.Debugw("refreshed cache", "rules", existingRules)
-
-	// note: we use a map here to de-duplicate accounts.
-	// this means that the RuleID in the accounts map is not necessarily
-	// the *only* Access Rule which grants access to that account.
-	accounts := map[string]cache.AccessTarget{}
-
-	// a map of access rule IDs that match each account ID
-	// Prod (123456789012) -> {"rul_123": true}
-	accessRulesForAccount := map[string]map[string]bool{}
-
-	for _, rule := range existingRules {
-		for _, t := range rule.Targets {
-			if t.Type == "accountId" {
-				if _, ok := accessRulesForAccount[t.Value]; !ok {
-					accessRulesForAccount[t.Value] = map[string]bool{}
-				}
-				accounts[t.Value] = t
-				accessRulesForAccount[t.Value][rule.ID] = true
-			}
-		}
-	}
-
 	// a mapping of the selected survey prompt option, back to the actual value
 	// e.g. "my-account-name (123456789012)" -> 123456789012
 	selectedAccountMap := map[string]string{}
@@ -191,7 +138,25 @@ func requestAccess(ctx context.Context, opts requestAccessOpts) error {
 
 	selectedAccountInfo, ok := accounts[selectedAccountID]
 	if !ok {
-		return clierr.New(fmt.Sprintf("account %s not found", selectedAccountID), clierr.Info("run 'granted exp request aws' to see a list of available accounts"))
+		clio.Info("account not found in cache, refreshing cache...")
+
+		err = clearCachedAccessRules(depID)
+		if err != nil {
+			return err
+		}
+
+		accounts, _, accessRulesForAccount, err = RefreshCachedAccessRules(ctx, depID, cf)
+		if err != nil {
+			return err
+		}
+		selectedAccountID := opts.account
+
+		selectedAccountInfo, ok = accounts[selectedAccountID]
+
+		if !ok {
+			return clierr.New(fmt.Sprintf("account %s not found", selectedAccountID), clierr.Info("run 'granted exp request aws' to see a list of available accounts"))
+		}
+
 	}
 
 	ruleIDs := accessRulesForAccount[selectedAccountID]
@@ -416,13 +381,107 @@ func requestAccess(ctx context.Context, opts requestAccessOpts) error {
 
 	if latestRequest.Status == types.RequestStatusAPPROVED {
 		durationDescription := durafmt.Parse(time.Duration(matchingAccessRule.DurationSeconds) * time.Second).LimitFirstN(1).String()
-		clio.Successf("[%s] Access is activated (expires in %s)", fullName, durationDescription)
-	}
+		profile, err := cfaws.LoadProfileByAccountIdAndRole(selectedAccountID, selectedRole)
+		if err != nil {
+			clio.Debugw("error while trying to automatically detect if profile is active", "error", err)
+			clio.Infof("To use the profile with the AWS CLI, sync your ~/.aws/config by running 'granted sso populate'. Then, run:\nexport AWS_PROFILE=%s", fullName)
+			return nil
+		}
 
+		if profile == nil {
+			clio.Debugw("unable to automatically await access because profile was not found")
+			clio.Infof("To use the profile with the AWS CLI, sync your ~/.aws/config by running 'granted sso populate'. Then, run:\nexport AWS_PROFILE=%s", fullName)
+			return nil
+		}
+		ssoAssumer := cfaws.AwsSsoAssumer{}
+		profile.ProfileType = ssoAssumer.Type()
+
+		clio.Debugf("attempting to assume the profile: %s to see that it is ready for use.", profile.Name)
+		si := spinner.New(spinner.CharSets[14], 100*time.Millisecond)
+		si.Suffix = "waiting for the profile to be ready..."
+		si.Writer = os.Stderr
+		si.Start()
+
+		// run assume with retry such that even if assume fails due to latency issue in provisioning, user will not have to rerun the command.
+		_, err = profile.AssumeTerminal(ctx, cfaws.ConfigOpts{
+			ShouldRetryAssuming: aws.Bool(true),
+		})
+		if err != nil {
+			clio.Debugw("error while trying to automatically detect if profile is active", "error", err)
+			clio.Infof("Unable to automatically detect whether this profile is ready")
+			clio.Infof("To use the profile with the AWS CLI, sync your ~/.aws/config by running 'granted sso populate'. Then, run:\nexport AWS_PROFILE=%s", fullName)
+			return nil
+		}
+		si.Stop()
+
+		clio.Successf("[%s] Access is activated (expires in %s)", fullName, durationDescription)
+		clio.NewLine()
+		clio.Infof("To use the profile with the AWS CLI, run:\nexport AWS_PROFILE=%s", fullName)
+		return nil
+	}
 	clio.NewLine()
-	clio.Infof("To use the profile with the AWS CLI, sync your ~/.aws/config by running 'granted sso populate'. Then, run:\nexport AWS_PROFILE=%s", fullName)
+	clio.Infof("Your request is not yet approved, to use the profile with the AWS CLI once it is approved, sync your ~/.aws/config by running 'granted sso populate'. Then, run:\nexport AWS_PROFILE=%s", fullName)
 
 	return nil
+}
+
+func RefreshCachedAccessRules(ctx context.Context, depID string, cf *types.ClientWithResponses) (accounts map[string]cache.AccessTarget, existingRules map[string]cache.AccessRule, accessRulesForAccount map[string]map[string]bool, err error) {
+	//try refreshing the cache and repulling accounts
+	// note: we use a map here to de-duplicate accounts.
+	// this means that the RuleID in the accounts map is not necessarily
+	// the *only* Access Rule which grants access to that account.
+	accounts = map[string]cache.AccessTarget{}
+
+	existingRules, err = getCachedAccessRules(depID)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	rules, err := cf.UserListAccessRulesWithResponse(ctx)
+	if err != nil {
+		return nil, nil, nil, err
+
+	}
+
+	for _, r := range rules.JSON200.AccessRules {
+		var g errgroup.Group
+
+		g.Go(func() error {
+			return updateCachedAccessRule(ctx, updateCacheOpts{
+				Rule:         r,
+				Existing:     existingRules,
+				DeploymentID: depID,
+				CF:           cf,
+			})
+		})
+
+		err = g.Wait()
+		if err != nil {
+			return nil, nil, nil, err
+		}
+
+	}
+
+	// refresh the cache
+	newexistingRules, err := getCachedAccessRules(depID)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	accessRulesForAccount = map[string]map[string]bool{}
+
+	for _, rule := range newexistingRules {
+		for _, t := range rule.Targets {
+			if t.Type == "accountId" {
+				if _, ok := accessRulesForAccount[t.Value]; !ok {
+					accessRulesForAccount[t.Value] = map[string]bool{}
+				}
+				accounts[t.Value] = t
+				accessRulesForAccount[t.Value][rule.ID] = true
+			}
+		}
+	}
+
+	return accounts, existingRules, accessRulesForAccount, nil
 }
 
 func getCachedAccessRules(depID string) (map[string]cache.AccessRule, error) {
@@ -455,6 +514,15 @@ func getCachedAccessRules(depID string) (map[string]cache.AccessRule, error) {
 	}
 
 	return rules, nil
+}
+
+func clearCachedAccessRules(depID string) error {
+	cacheFolder, err := getCacheFolder(depID)
+	if err != nil {
+		return err
+	}
+
+	return os.RemoveAll(cacheFolder)
 }
 
 type updateCacheOpts struct {
